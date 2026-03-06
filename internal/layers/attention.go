@@ -3,9 +3,13 @@ package layers
 import (
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	mathops "github.com/ivora/go_llama3/internal/math"
 )
+
+const attentionParallelThreshold = 4
 
 type KVLayerCache struct {
 	K []float32 // [cached_seq, numKVHeads, headDim]
@@ -42,29 +46,69 @@ func (a AttentionWeights) Forward(x []float32, seqLen int, rope *RoPE, startPos 
 	kAll := make([]float32, seqLen*kvHidden)
 	vAll := make([]float32, seqLen*kvHidden)
 
-	for t := 0; t < seqLen; t++ {
-		token := x[t*a.HiddenSize : (t+1)*a.HiddenSize]
-		if err := mathops.MatVec(qAll[t*a.HiddenSize:(t+1)*a.HiddenSize], a.Wq, token, a.HiddenSize, a.HiddenSize); err != nil {
-			return nil, err
+	parallelTokens := seqLen >= attentionParallelThreshold
+	if parallelTokens {
+		var wg sync.WaitGroup
+		nWorkers := runtime.NumCPU()
+		if nWorkers > seqLen {
+			nWorkers = seqLen
 		}
-		if err := mathops.MatVec(kAll[t*kvHidden:(t+1)*kvHidden], a.Wk, token, kvHidden, a.HiddenSize); err != nil {
-			return nil, err
+		chunk := (seqLen + nWorkers - 1) / nWorkers
+		for w := 0; w < nWorkers; w++ {
+			tStart := w * chunk
+			tEnd := tStart + chunk
+			if tEnd > seqLen {
+				tEnd = seqLen
+			}
+			if tStart >= tEnd {
+				continue
+			}
+			wg.Add(1)
+			go func(ts, te int) {
+				defer wg.Done()
+				for t := ts; t < te; t++ {
+					token := x[t*a.HiddenSize : (t+1)*a.HiddenSize]
+					_ = mathops.MatVec(qAll[t*a.HiddenSize:(t+1)*a.HiddenSize], a.Wq, token, a.HiddenSize, a.HiddenSize)
+					_ = mathops.MatVec(kAll[t*kvHidden:(t+1)*kvHidden], a.Wk, token, kvHidden, a.HiddenSize)
+					_ = mathops.MatVec(vAll[t*kvHidden:(t+1)*kvHidden], a.Wv, token, kvHidden, a.HiddenSize)
+				}
+			}(tStart, tEnd)
 		}
-		if err := mathops.MatVec(vAll[t*kvHidden:(t+1)*kvHidden], a.Wv, token, kvHidden, a.HiddenSize); err != nil {
-			return nil, err
+		wg.Wait()
+		for t := 0; t < seqLen; t++ {
+			pos := startPos + t
+			for h := 0; h < a.NumHeads; h++ {
+				qHead := qAll[t*a.HiddenSize+h*a.HeadDim : t*a.HiddenSize+(h+1)*a.HeadDim]
+				rope.Apply(qHead, pos)
+			}
+			for h := 0; h < a.NumKVHeads; h++ {
+				kHead := kAll[t*kvHidden+h*a.HeadDim : t*kvHidden+(h+1)*a.HeadDim]
+				rope.Apply(kHead, pos)
+			}
 		}
-	}
-
-	// Apply RoPE to Q and K.
-	for t := 0; t < seqLen; t++ {
-		pos := startPos + t
-		for h := 0; h < a.NumHeads; h++ {
-			qHead := qAll[t*a.HiddenSize+h*a.HeadDim : t*a.HiddenSize+(h+1)*a.HeadDim]
-			rope.Apply(qHead, pos)
+	} else {
+		for t := 0; t < seqLen; t++ {
+			token := x[t*a.HiddenSize : (t+1)*a.HiddenSize]
+			if err := mathops.MatVec(qAll[t*a.HiddenSize:(t+1)*a.HiddenSize], a.Wq, token, a.HiddenSize, a.HiddenSize); err != nil {
+				return nil, err
+			}
+			if err := mathops.MatVec(kAll[t*kvHidden:(t+1)*kvHidden], a.Wk, token, kvHidden, a.HiddenSize); err != nil {
+				return nil, err
+			}
+			if err := mathops.MatVec(vAll[t*kvHidden:(t+1)*kvHidden], a.Wv, token, kvHidden, a.HiddenSize); err != nil {
+				return nil, err
+			}
 		}
-		for h := 0; h < a.NumKVHeads; h++ {
-			kHead := kAll[t*kvHidden+h*a.HeadDim : t*kvHidden+(h+1)*a.HeadDim]
-			rope.Apply(kHead, pos)
+		for t := 0; t < seqLen; t++ {
+			pos := startPos + t
+			for h := 0; h < a.NumHeads; h++ {
+				qHead := qAll[t*a.HiddenSize+h*a.HeadDim : t*a.HiddenSize+(h+1)*a.HeadDim]
+				rope.Apply(qHead, pos)
+			}
+			for h := 0; h < a.NumKVHeads; h++ {
+				kHead := kAll[t*kvHidden+h*a.HeadDim : t*kvHidden+(h+1)*a.HeadDim]
+				rope.Apply(kHead, pos)
+			}
 		}
 	}
 
@@ -94,32 +138,85 @@ func (a AttentionWeights) Forward(x []float32, seqLen int, rope *RoPE, startPos 
 	groupSize := a.NumHeads / a.NumKVHeads
 	attnOut := make([]float32, seqLen*a.HiddenSize)
 	score := make([]float32, totalSeq)
-	for t := 0; t < seqLen; t++ {
-		globalPos := startPos + t
-		for qh := 0; qh < a.NumHeads; qh++ {
-			kvh := qh / groupSize
-			qVec := qAll[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
-			for s := 0; s < totalSeq; s++ {
-				// causal masking
-				if s > globalPos {
-					score[s] = float32(-1e9)
-					continue
+	if parallelTokens {
+		var wg sync.WaitGroup
+		nWorkers := runtime.NumCPU()
+		if nWorkers > seqLen {
+			nWorkers = seqLen
+		}
+		chunk := (seqLen + nWorkers - 1) / nWorkers
+		for w := 0; w < nWorkers; w++ {
+			tStart := w * chunk
+			tEnd := tStart + chunk
+			if tEnd > seqLen {
+				tEnd = seqLen
+			}
+			if tStart >= tEnd {
+				continue
+			}
+			wg.Add(1)
+			go func(ts, te int) {
+				defer wg.Done()
+				localScore := make([]float32, totalSeq)
+				for t := ts; t < te; t++ {
+					globalPos := startPos + t
+					for qh := 0; qh < a.NumHeads; qh++ {
+						kvh := qh / groupSize
+						qVec := qAll[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
+						for s := 0; s < totalSeq; s++ {
+							if s > globalPos {
+								localScore[s] = float32(-1e9)
+								continue
+							}
+							kBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
+							kVec := fullK[kBase : kBase+a.HeadDim]
+							localScore[s] = mathops.DotProduct(qVec, kVec) * a.ScaleFactor
+						}
+						mathops.SoftmaxInplace(localScore)
+						outHead := attnOut[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
+						for i := range outHead {
+							outHead[i] = 0
+						}
+						for s := 0; s < totalSeq; s++ {
+							vBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
+							vVec := fullV[vBase : vBase+a.HeadDim]
+							w := localScore[s]
+							for i := 0; i < a.HeadDim; i++ {
+								outHead[i] += w * vVec[i]
+							}
+						}
+					}
 				}
-				kBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
-				kVec := fullK[kBase : kBase+a.HeadDim]
-				score[s] = mathops.DotProduct(qVec, kVec) * a.ScaleFactor
-			}
-			mathops.SoftmaxInplace(score)
-			outHead := attnOut[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
-			for i := range outHead {
-				outHead[i] = 0
-			}
-			for s := 0; s < totalSeq; s++ {
-				vBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
-				vVec := fullV[vBase : vBase+a.HeadDim]
-				w := score[s]
-				for i := 0; i < a.HeadDim; i++ {
-					outHead[i] += w * vVec[i]
+			}(tStart, tEnd)
+		}
+		wg.Wait()
+	} else {
+		for t := 0; t < seqLen; t++ {
+			globalPos := startPos + t
+			for qh := 0; qh < a.NumHeads; qh++ {
+				kvh := qh / groupSize
+				qVec := qAll[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
+				for s := 0; s < totalSeq; s++ {
+					if s > globalPos {
+						score[s] = float32(-1e9)
+						continue
+					}
+					kBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
+					kVec := fullK[kBase : kBase+a.HeadDim]
+					score[s] = mathops.DotProduct(qVec, kVec) * a.ScaleFactor
+				}
+				mathops.SoftmaxInplace(score)
+				outHead := attnOut[t*a.HiddenSize+qh*a.HeadDim : t*a.HiddenSize+(qh+1)*a.HeadDim]
+				for i := range outHead {
+					outHead[i] = 0
+				}
+				for s := 0; s < totalSeq; s++ {
+					vBase := s*a.NumKVHeads*a.HeadDim + kvh*a.HeadDim
+					vVec := fullV[vBase : vBase+a.HeadDim]
+					w := score[s]
+					for i := 0; i < a.HeadDim; i++ {
+						outHead[i] += w * vVec[i]
+					}
 				}
 			}
 		}
@@ -127,11 +224,40 @@ func (a AttentionWeights) Forward(x []float32, seqLen int, rope *RoPE, startPos 
 
 	// Output projection Wo.
 	projected := make([]float32, seqLen*a.HiddenSize)
-	for t := 0; t < seqLen; t++ {
-		tokenOut := projected[t*a.HiddenSize : (t+1)*a.HiddenSize]
-		tokenIn := attnOut[t*a.HiddenSize : (t+1)*a.HiddenSize]
-		if err := mathops.MatVec(tokenOut, a.Wo, tokenIn, a.HiddenSize, a.HiddenSize); err != nil {
-			return nil, err
+	if parallelTokens {
+		var wg sync.WaitGroup
+		nWorkers := runtime.NumCPU()
+		if nWorkers > seqLen {
+			nWorkers = seqLen
+		}
+		chunk := (seqLen + nWorkers - 1) / nWorkers
+		for w := 0; w < nWorkers; w++ {
+			tStart := w * chunk
+			tEnd := tStart + chunk
+			if tEnd > seqLen {
+				tEnd = seqLen
+			}
+			if tStart >= tEnd {
+				continue
+			}
+			wg.Add(1)
+			go func(ts, te int) {
+				defer wg.Done()
+				for t := ts; t < te; t++ {
+					tokenOut := projected[t*a.HiddenSize : (t+1)*a.HiddenSize]
+					tokenIn := attnOut[t*a.HiddenSize : (t+1)*a.HiddenSize]
+					_ = mathops.MatVec(tokenOut, a.Wo, tokenIn, a.HiddenSize, a.HiddenSize)
+				}
+			}(tStart, tEnd)
+		}
+		wg.Wait()
+	} else {
+		for t := 0; t < seqLen; t++ {
+			tokenOut := projected[t*a.HiddenSize : (t+1)*a.HiddenSize]
+			tokenIn := attnOut[t*a.HiddenSize : (t+1)*a.HiddenSize]
+			if err := mathops.MatVec(tokenOut, a.Wo, tokenIn, a.HiddenSize, a.HiddenSize); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return projected, nil

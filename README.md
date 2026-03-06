@@ -9,6 +9,8 @@ High-performance Llama 3.2 text inference engine in pure Go. Loads safetensor we
 
 ## Model Setup
 
+### Option 1: Safetensors (directory)
+
 Place a Llama 3.2 model in a directory with:
 
 - `config.json`
@@ -17,6 +19,10 @@ Place a Llama 3.2 model in a directory with:
 - `model-00001-of-00002.safetensors`, `model-00002-of-00002.safetensors`, etc.
 
 Download models from [Meta Llama](https://llama.meta.com/) or [Hugging Face](https://huggingface.co/meta-llama).
+
+### Option 2: Single GGUF file
+
+Use a `.gguf` file (F32 or F16 only; quantized types are not supported). Place `tokenizer.json` in the same directory as the GGUF file. Download GGUF models from [Hugging Face](https://huggingface.co/models?search=gguf) (e.g. from TheBloke or other converters).
 
 ## Running Local Inference
 
@@ -33,7 +39,11 @@ go build -o go_llama3 ./cmd/go_llama3
 ### Run
 
 ```bash
-./go_llama3 --model /path/to/model --prompt "Hello, how are you?"
+# From a safetensors directory
+./go_llama3 --model /path/to/model_dir --prompt "Hello, how are you?"
+
+# From a single GGUF file (tokenizer.json must be in the same directory)
+./go_llama3 --model /path/to/model.gguf --prompt "Hello, how are you?"
 ```
 
 ### Options

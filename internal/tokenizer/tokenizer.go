@@ -32,6 +32,36 @@ func LoadFromModelDir(modelDir string) (*Tokenizer, error) {
 	return Load(filepath.Join(modelDir, "tokenizer.json"))
 }
 
+// LoadFromGGUF builds a tokenizer from GGUF metadata (tokenizer.ggml.tokens array).
+// Falls back to tokenizer.json at tokenizerPath if the GGUF has no embedded tokenizer.
+func LoadFromGGUF(meta map[string]any, tokenizerPath string) (*Tokenizer, error) {
+	tokensVal, ok := meta["tokenizer.ggml.tokens"]
+	if !ok {
+		return Load(tokenizerPath)
+	}
+	arr, ok := tokensVal.([]any)
+	if !ok || len(arr) == 0 {
+		return Load(tokenizerPath)
+	}
+	tokenToID := make(map[string]int32, len(arr))
+	idToToken := make(map[int32]string, len(arr))
+	for i, v := range arr {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		id := int32(i)
+		tokenToID[s] = id
+		idToToken[id] = s
+	}
+	t := &Tokenizer{
+		tokenToID: tokenToID,
+		idToToken: idToToken,
+		unknownID: chooseUnknownID(tokenToID),
+	}
+	return t, nil
+}
+
 func Load(path string) (*Tokenizer, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

@@ -13,11 +13,17 @@ func TestGenerateJSON_ObjectShape(t *testing.T) {
 	if modelPath == "" {
 		t.Skip("set GO_LLAMA3_MODEL_PATH to run integration inference tests")
 	}
-	if _, err := os.Stat(filepath.Join(modelPath, "config.json")); err != nil {
-		t.Skip("model path missing config.json")
+	if st, err := os.Stat(modelPath); err != nil {
+		t.Skip("model path not accessible")
+	} else if st.IsDir() {
+		if _, err := os.Stat(filepath.Join(modelPath, "config.json")); err != nil {
+			t.Skip("model dir missing config.json")
+		}
+	} else if !strings.HasSuffix(strings.ToLower(modelPath), ".gguf") {
+		t.Skip("model path must be directory or .gguf file")
 	}
 
-	m, err := LoadFromDir(modelPath)
+	m, err := Load(modelPath)
 	if err != nil {
 		t.Fatalf("LoadFromDir: %v", err)
 	}
@@ -56,7 +62,7 @@ func TestGenerateJSON_ArrayShape(t *testing.T) {
 		t.Skip("set GO_LLAMA3_MODEL_PATH to run integration inference tests")
 	}
 
-	m, err := LoadFromDir(modelPath)
+	m, err := Load(modelPath)
 	if err != nil {
 		t.Fatalf("LoadFromDir: %v", err)
 	}

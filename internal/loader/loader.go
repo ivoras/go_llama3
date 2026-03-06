@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/nlpodyssey/safetensors"
@@ -16,6 +17,21 @@ import (
 const (
 	indexFileName = "model.safetensors.index.json"
 )
+
+// WeightLoader loads model weights. Implemented by Loader (safetensors) and GGUFLoader.
+type WeightLoader interface {
+	LoadTensor(name string) (Tensor, error)
+	TensorNames() []string
+}
+
+// NewFromPath creates a WeightLoader from a path. If path is a .gguf file, loads GGUF.
+// Otherwise treats path as a model directory with safetensors.
+func NewFromPath(path string) (WeightLoader, error) {
+	if strings.HasSuffix(strings.ToLower(path), ".gguf") {
+		return NewGGUF(path)
+	}
+	return New(path)
+}
 
 type IndexFile struct {
 	Metadata  map[string]string `json:"metadata"`

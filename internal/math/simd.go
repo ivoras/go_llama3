@@ -3,11 +3,15 @@ package mathops
 import (
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/ajroetker/go-highway/hwy"
 	"github.com/ajroetker/go-highway/hwy/contrib/algo"
 	"golang.org/x/sys/cpu"
 )
+
+const parallelThreshold = 64 // min rows to use parallel path
 
 // CPUFeatures captures runtime SIMD capability detection.
 type CPUFeatures struct {
@@ -174,6 +178,15 @@ func MatMul(a, b []float32, m, n, p int) ([]float32, error) {
 		return nil, fmt.Errorf("matmul invalid B size got=%d want=%d", len(b), n*p)
 	}
 	c := make([]float32, m*p)
+	if m >= parallelThreshold {
+		matMulParallel(c, a, b, m, n, p)
+	} else {
+		matMulBlock(c, a, b, m, n, p)
+	}
+	return c, nil
+}
+
+func matMulBlock(c, a, b []float32, m, n, p int) {
 	lanes := hwy.NumLanes[float32]()
 	const block = 64
 	for ii := 0; ii < m; ii += block {
@@ -205,7 +218,66 @@ func MatMul(a, b []float32, m, n, p int) ([]float32, error) {
 			}
 		}
 	}
-	return c, nil
+}
+
+func matMulParallel(c, a, b []float32, m, n, p int) {
+	nWorkers := runtime.NumCPU()
+	if nWorkers > m {
+		nWorkers = m
+	}
+	if nWorkers < 2 {
+		matMulBlock(c, a, b, m, n, p)
+		return
+	}
+	var wg sync.WaitGroup
+	chunk := (m + nWorkers - 1) / nWorkers
+	for w := 0; w < nWorkers; w++ {
+		iStart := w * chunk
+		iEnd := min(iStart+chunk, m)
+		if iStart >= iEnd {
+			continue
+		}
+		wg.Add(1)
+		go func(i0, i1 int) {
+			defer wg.Done()
+			matMulBlockRange(c, a, b, m, n, p, i0, i1)
+		}(iStart, iEnd)
+	}
+	wg.Wait()
+}
+
+func matMulBlockRange(c, a, b []float32, m, n, p, iStart, iEnd int) {
+	lanes := hwy.NumLanes[float32]()
+	const block = 64
+	for ii := iStart; ii < iEnd; ii += block {
+		iMax := min(ii+block, iEnd)
+		for kk := 0; kk < n; kk += block {
+			kMax := min(kk+block, n)
+			for jj := 0; jj < p; jj += block {
+				jMax := min(jj+block, p)
+				for i := ii; i < iMax; i++ {
+					aRow := i * n
+					cRow := i * p
+					for k := kk; k < kMax; k++ {
+						aik := a[aRow+k]
+						bRow := k * p
+						aikVec := hwy.Set[float32](aik)
+						j := jj
+						for j+lanes <= jMax {
+							cv := hwy.Load(c[cRow+j:])
+							bv := hwy.Load(b[bRow+j:])
+							hwy.Store(hwy.FMA(aikVec, bv, cv), c[cRow+j:])
+							j += lanes
+						}
+						for j < jMax {
+							c[cRow+j] += aik * b[bRow+j]
+							j++
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func MatVec(out, mat, vec []float32, rows, cols int) error {
@@ -218,10 +290,48 @@ func MatVec(out, mat, vec []float32, rows, cols int) error {
 	if len(out) != rows {
 		return fmt.Errorf("matvec invalid output size")
 	}
+	if rows >= parallelThreshold {
+		MatVecParallel(out, mat, vec, rows, cols)
+		return nil
+	}
 	for r := 0; r < rows; r++ {
 		out[r] = DotProduct(mat[r*cols:(r+1)*cols], vec)
 	}
 	return nil
+}
+
+// MatVecParallel computes out = mat * vec using goroutines across rows.
+func MatVecParallel(out, mat, vec []float32, rows, cols int) {
+	nWorkers := runtime.NumCPU()
+	if nWorkers > rows {
+		nWorkers = rows
+	}
+	if nWorkers < 2 {
+		for r := 0; r < rows; r++ {
+			out[r] = DotProduct(mat[r*cols:(r+1)*cols], vec)
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	chunk := (rows + nWorkers - 1) / nWorkers
+	for w := 0; w < nWorkers; w++ {
+		start := w * chunk
+		end := start + chunk
+		if end > rows {
+			end = rows
+		}
+		if start >= end {
+			continue
+		}
+		wg.Add(1)
+		go func(rStart, rEnd int) {
+			defer wg.Done()
+			for r := rStart; r < rEnd; r++ {
+				out[r] = DotProduct(mat[r*cols:(r+1)*cols], vec)
+			}
+		}(start, end)
+	}
+	wg.Wait()
 }
 
 // AddInPlace adds src to dst element-wise using SIMD.
